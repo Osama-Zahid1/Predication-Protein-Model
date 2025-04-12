@@ -1,0 +1,268 @@
+# ======================
+# Reproducibility Setup
+# ======================
+import os
+import random
+import numpy as np
+import pandas as pd
+import re
+import tensorflow as tf
+from sklearn.preprocessing import LabelEncoder, MultiLabelBinarizer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, hamming_loss, f1_score, jaccard_score, precision_recall_curve
+from tensorflow.keras.models import Model, Sequential, load_model
+from tensorflow.keras.layers import Input, Embedding, Conv1D, GlobalMaxPooling1D, Dense, Dropout, Concatenate, MaxPooling1D, Bidirectional, LSTM, BatchNormalization, Attention, LayerNormalization
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+
+def set_seed(seed=42):
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'
+
+set_seed(42)
+print("0. Set random seeds for reproducibility")
+
+# ======================
+# Data Loading
+# ======================
+print("\n1. Loading dataset...")
+df = pd.read_excel('Small_Data.xlsx')
+print(f"   Dataset contains {len(df)} entries")
+print(f"   Columns used:")
+print(f"   - Training: 'Sequence' (Base Model), 'Sequence' + 'Subcellular location [CC]' (Enhanced Model)")
+print(f"   - Target: 'Gene Ontology (cellular component)' (both models)")
+
+# ======================
+# Data Cleaning
+# ======================
+print("\n2. Cleaning protein sequences...")
+def clean_sequence(seq):
+    cleaned = ''.join([c if c in "ACDEFGHIKLMNPQRSTVWYUOBZX" else 'X' for c in str(seq)])
+    return cleaned
+
+df['Sequence'] = df['Sequence'].apply(clean_sequence)
+max_seq_length = 512
+print(f"   Max sequence length: {max_seq_length}")
+print(f"   Example cleaned sequence: {df['Sequence'][0][:50]}...")
+
+# ======================
+# Sequence Encoding
+# ======================
+print("\n3. Encoding amino acid sequences...")
+aa_vocab = list("ACDEFGHIKLMNPQRSTVWYUOBZX")
+le = LabelEncoder().fit(aa_vocab)
+X_seq = [le.transform(list(seq[:max_seq_length])) for seq in df['Sequence']]
+X_seq = pad_sequences(X_seq, maxlen=max_seq_length, padding='post', truncating='post', dtype='int32')
+print(f"   Sequence matrix shape: {X_seq.shape}")
+
+# ======================
+# Location Text Processing
+# ======================
+print("\n4. Processing subcellular locations...")
+location_texts = df['Subcellular location [CC]'].fillna('').apply(
+    lambda x: re.sub(r'SUBCELLULAR LOCATION: |\{.*?\}', '', str(x)).strip()
+)
+print(f"   Example location text: {location_texts[0][:50]}...")
+
+# ======================
+# Location Vectorization
+# ======================
+print("\n5. Vectorizing location data...")
+tfidf = TfidfVectorizer(max_features=300, ngram_range=(1, 2), stop_words='english')
+X_loc = tfidf.fit_transform(location_texts).toarray()
+print(f"   Location matrix shape: {X_loc.shape}")
+
+# ======================
+# Label Encoding
+# ======================
+print("\n6. Encoding cellular component labels...")
+def process_labels(label_string):
+    if pd.isna(label_string) or label_string.strip() == "":
+        return []
+    return [x.strip() for x in str(label_string).split(';')]
+
+# Use the correct function name here
+cellular_components = df['Gene Ontology (cellular component)'].apply(process_labels)
+mlb = MultiLabelBinarizer()
+y = mlb.fit_transform(cellular_components)
+print(f"   Number of cellular component classes: {len(mlb.classes_)}")
+print(f"   Example classes: {mlb.classes_[:5]}")
+
+# ======================
+# Train-Test Split
+# ======================
+print("\n7. Splitting data into train/test sets...")
+(X_seq_train, X_seq_test, 
+ X_loc_train, X_loc_test,
+ y_train, y_test) = train_test_split(X_seq, X_loc, y, test_size=0.2, random_state=42)
+print(f"   Training sequences: {X_seq_train.shape}")
+print(f"   Testing sequences: {X_seq_test.shape}")
+
+# ======================
+# Base Model (Sequence Only)
+# ======================
+print("\n8. Building Base Model...")
+def build_base_model(vocab_size, seq_length, num_classes):
+    model = Sequential([
+        Input(shape=(seq_length,)),
+        Embedding(vocab_size, 128, input_length=seq_length),
+        Bidirectional(LSTM(64, return_sequences=True)),
+        Conv1D(128, 5, activation='relu', padding='same'),
+        BatchNormalization(),
+        MaxPooling1D(2),
+        Dropout(0.4),
+        Bidirectional(LSTM(32)),
+        Dense(128, activation='relu'),
+        Dense(num_classes, activation='sigmoid')
+    ])
+    model.compile(optimizer=Adam(0.001, clipnorm=1.0),
+                  loss='binary_crossentropy',
+                  metrics=['accuracy'])
+    return model
+
+model_base = build_base_model(len(aa_vocab) + 1, max_seq_length, y.shape[1])
+model_base.summary()
+
+# ======================
+# Enhanced Model (Sequence + Location)
+# ======================
+print("\n9. Building Enhanced Model...")
+def build_enhanced_model(vocab_size, seq_length, loc_dim, num_classes):
+    input_seq = Input(shape=(seq_length,))
+    x = Embedding(vocab_size, 128)(input_seq)
+    x = Bidirectional(LSTM(64, return_sequences=True))(x)
+    x = Attention()([x, x])
+    x = LayerNormalization()(x)
+    x = GlobalMaxPooling1D()(x)
+    
+    input_loc = Input(shape=(loc_dim,))
+    y = Dense(256, activation='relu')(input_loc)
+    y = BatchNormalization()(y)
+    y = Dropout(0.5)(y)
+    
+    combined = Concatenate()([x, y])
+    z = Dense(512, activation='relu')(combined)
+    z = Dropout(0.6)(z)
+    output = Dense(num_classes, activation='sigmoid')(z)
+    
+    model = Model(inputs=[input_seq, input_loc], outputs=output)
+    model.compile(optimizer=Adam(0.0005, clipvalue=0.5),
+                  loss='binary_crossentropy',
+                  metrics=['accuracy'])
+    return model
+
+model_enhanced = build_enhanced_model(len(aa_vocab) + 1, max_seq_length, X_loc.shape[1], y.shape[1])
+model_enhanced.summary()
+
+# ======================
+# Training Setup
+# ======================
+print("\n10. Setting up training configurations...")
+def get_class_weights(y_train):
+    positive_counts = np.sum(y_train, axis=0)
+    total = len(y_train)
+    return {i: total/(2*count) if count > 0 else 1.0 
+            for i, count in enumerate(positive_counts)}
+
+class_weights = get_class_weights(y_train)
+
+# ======================
+# Model Training
+# ======================
+print("\n11. Training Base Model...")
+callbacks_base = [
+    EarlyStopping(patience=5, restore_best_weights=True),
+    ReduceLROnPlateau(factor=0.2, patience=3),
+    ModelCheckpoint('GeneCell3_best_base_model.keras', save_best_only=True)
+]
+
+history_base = model_base.fit(
+    X_seq_train, y_train,
+    class_weight=class_weights,
+    epochs=50,
+    batch_size=64,
+    validation_split=0.2,
+    callbacks=callbacks_base,
+    verbose=1
+)
+
+print("\n12. Training Enhanced Model...")
+callbacks_enhanced = [
+    EarlyStopping(patience=5, restore_best_weights=True),
+    ReduceLROnPlateau(factor=0.2, patience=3),
+    ModelCheckpoint('GeneCell3_best_enhanced_model.keras', save_best_only=True)
+]
+
+history_enhanced = model_enhanced.fit(
+    [X_seq_train, X_loc_train], y_train,
+    class_weight=class_weights,
+    epochs=50,
+    batch_size=64,
+    validation_split=0.2,
+    callbacks=callbacks_enhanced,
+    verbose=1
+)
+
+# ======================
+# Evaluation Functions
+# ======================
+def evaluate_multi_label(y_true, y_pred_prob, threshold=0.5):
+    y_pred_bin = (y_pred_prob > threshold).astype(int)
+    return {
+        'Hamming Loss': hamming_loss(y_true, y_pred_bin),
+        'F1 Micro': f1_score(y_true, y_pred_bin, average='micro', zero_division=0),
+        'F1 Macro': f1_score(y_true, y_pred_bin, average='macro', zero_division=0),
+        'Jaccard Score': jaccard_score(y_true, y_pred_bin, average='samples', zero_division=0),
+        'Exact Match Ratio': accuracy_score(y_true, y_pred_bin)
+    }
+
+def optimize_thresholds(y_true, y_pred_prob):
+    thresholds = []
+    for i in range(y_true.shape[1]):
+        precision, recall, thrs = precision_recall_curve(y_true[:,i], y_pred_prob[:,i])
+        f1_scores = 2*precision*recall/(precision + recall + 1e-8)
+        thresholds.append(thrs[np.nanargmax(f1_scores)] if any(y_true[:,i]) else 0.5)
+    return np.array(thresholds)
+
+# ======================
+# Final Evaluation
+# ======================
+print("\n13. Evaluating Models...")
+
+print("\nBase Model Evaluation:")
+base_model = load_model('GeneCell3_best_base_model.keras')
+y_pred_base = base_model.predict(X_seq_test)
+base_thresholds = optimize_thresholds(y_train, base_model.predict(X_seq_train))
+base_metrics = evaluate_multi_label(y_test, y_pred_base, base_thresholds)
+
+print("\nEnhanced Model Evaluation:")
+enhanced_model = load_model('GeneCell3_best_enhanced_model.keras')
+y_pred_enhanced = enhanced_model.predict([X_seq_test, X_loc_test])
+enhanced_thresholds = optimize_thresholds(y_train, enhanced_model.predict([X_seq_train, X_loc_train]))
+enhanced_metrics = evaluate_multi_label(y_test, y_pred_enhanced, enhanced_thresholds)
+
+# ======================
+# Results Presentation
+# ======================
+def print_metrics(metrics, model_name):
+    print(f"\n{model_name} Performance:")
+    print(f"• Exact Match Ratio: {metrics['Exact Match Ratio']:.2%}")
+    print(f"• Hamming Loss: {metrics['Hamming Loss']:.4f}")
+    print(f"• F1 Micro: {metrics['F1 Micro']:.2%}")
+    print(f"• F1 Macro: {metrics['F1 Macro']:.2%}")
+    print(f"• Jaccard Score: {metrics['Jaccard Score']:.2%}")
+
+print_metrics(base_metrics, "Base Model")
+print_metrics(enhanced_metrics, "Enhanced Model")
+
+print("\n14. Interpretation Guide:")
+print("• Exact Match Ratio: Percentage of completely correct predictions")
+print("• Hamming Loss: Fraction of incorrect labels (lower is better)")
+print("• F1 Micro: Accuracy considering all labels equally")
+print("• F1 Macro: Average accuracy across all classes")
+print("• Jaccard Score: Similarity between predicted and true labels")
