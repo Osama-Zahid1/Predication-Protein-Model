@@ -68,7 +68,7 @@ The dataset was manually curated from [UniProt](https://www.uniprot.org/) and co
 | F1 Macro             | 1.61%      | 2.42%          |
 | Jaccard Score        | 1.99%      | 1.70%          |
 
-> **Note**: Protein function prediction is a complex task, especially with sparse and overlapping multi-labels. The enhanced model still shows a consistent improvement across most metrics.
+> **Note**: Protein function prediction is a complex task, especially with sparse and overlapping multi-labels. The enhanced model still shows a consistent improvement across most metrics. Also lack of resources I didnt further made it complex or used pretrained model like Protbert. This is for learning purpose for understanding the Deep learning model.
 
 ---
 
@@ -79,19 +79,6 @@ The dataset was manually curated from [UniProt](https://www.uniprot.org/) and co
 - **F1 Macro**: Treats all classes equally — lower for imbalanced data.
 - **Jaccard Score**: Measures overlap between prediction and true labels.
 - **Exact Match Ratio**: How often the entire label set was predicted correctly (very strict).
-
----
-
-## 📚 How to Run
-
-1. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-2. Add your dataset as `Small_Data.xlsx`.
-
-3. Run the notebook or script containing the model training code.
 
 ---
 
